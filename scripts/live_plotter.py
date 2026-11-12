@@ -1,143 +1,198 @@
-"""
-live_plotter.py
-Adquisición y visualización gráfica en tiempo real de telemetría serial.
-Proyecto: Sistema Híbrido de Sensado Electromagnético (INCIETEC 2026-2)
-Autor: Gabriel Jaime Gómez Restrepo
-"""
+"""INCIETEC: Arduino Nano -> Python -> MySQL + CSV + graficas.
 
-import sys
-import os
+Requiere el firmware lector_pulsos_manual_mysql.ino de este paquete.
+Formato: TIMESTAMP_MS,CONTEO_EVENTOS,INTERVALO_S,FRECUENCIA_HZ,ESTADO_LOGICO
+Este codigo usa Visual Studio o Visual Studio Code en Windows.
+"""
 import csv
+import math
+import sys
 import time
+from collections import deque
+from datetime import datetime
+from getpass import getpass
+from pathlib import Path
+
+import mysql.connector
 import serial
 import serial.tools.list_ports
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-from collections import deque
+from matplotlib.animation import FuncAnimation
 
-# Configuración de puerto y comunicación
-BAUD_RATE = 115200
-VENTANA_MUESTRAS = 60  # Muestra los últimos 60 puntos en pantalla
-
-# Colas circulares para la visualización fluida
-tiempos_s = deque(maxlen=VENTANA_MUESTRAS)
-frecuencias_hz = deque(maxlen=VENTANA_MUESTRAS)
-rpms = deque(maxlen=VENTANA_MUESTRAS)
+# Si la deteccion falla, indica el COM real. Ejemplo: "COM3".
+PUERTO_MANUAL = None
+BAUDIOS = 115200
+ULTIMAS_MUESTRAS = 60
 
 
-def auto_detectar_puerto():
-    """Detecta automáticamente el puerto COM/ttyUSB donde está el Arduino."""
-    puertos = serial.tools.list_ports.comports()
-    for p in puertos:
+def detectar_puerto():
+    if PUERTO_MANUAL:
+        return PUERTO_MANUAL
+    candidatos = list(serial.tools.list_ports.comports())
+    for p in candidatos:
         desc = p.description.lower()
-        if "ch340" in desc or "arduino" in desc or "usb-serial" in desc or "usb serial" in desc:
+        if any(x in desc for x in ("arduino", "ch340", "usb-serial", "usb serial")):
             return p.device
-    if puertos:
-        return puertos[0].device
-    return None
+    return candidatos[0].device if len(candidatos) == 1 else None
 
 
-puerto_serial = auto_detectar_puerto()
-if not puerto_serial:
-    print("[ERROR] No se detectó ninguna placa conectada por USB.")
-    print("Conecta el Arduino Nano y vuelve a ejecutar el script.")
-    sys.exit(1)
-
-print(f"[CONECTADO] Abriendo puerto serial: {puerto_serial} a {BAUD_RATE} baudios...")
-try:
-    ser = serial.Serial(puerto_serial, BAUD_RATE, timeout=0.1)
-    time.sleep(2.0)  # Tiempo de estabilización tras el reset del Arduino
-except Exception as e:
-    print(f"[ERROR] No se pudo abrir el puerto: {e}")
-    sys.exit(1)
-
-# Asegurar la existencia del directorio de datos
-os.makedirs("data", exist_ok=True)
-archivo_csv = "data/registro_telemetria.csv"
-f_csv = open(archivo_csv, "w", newline="", encoding="utf-8")
-writer = csv.writer(f_csv)
-writer.writerow(["Timestamp_ms", "Evento_ID", "Periodo_us", "Frecuencia_Hz", "RPM_Estimado"])
-f_csv.flush()
-print(f"[TELEMETRÍA] Registrando datos en: {archivo_csv}")
-
-# Configuración de la interfaz gráfica
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 6))
-fig.canvas.manager.set_window_title("INCIETEC 2026-2 | Telemetría Electromagnética BJT")
-fig.subplots_adjust(hspace=0.35)
-
-(line_hz,) = ax1.plot([], [], "b-o", markersize=4, lw=1.8, label="Frecuencia (Hz)")
-ax1.set_title("Frecuencia de Perturbación Electromagnética (Ley de Faraday)", fontsize=11, fontweight="bold")
-ax1.set_ylabel("Frecuencia [Hz]")
-ax1.set_ylim(-0.5, 25.0)
-ax1.grid(True, linestyle="--", alpha=0.6)
-ax1.legend(loc="upper left")
-
-(line_rpm,) = ax2.plot([], [], "r-s", markersize=4, lw=1.8, label="Tacómetro (RPM)")
-ax2.set_title("Velocidad Angular Estimada / Eventos por Minuto", fontsize=11, fontweight="bold")
-ax2.set_xlabel("Tiempo Relativo [s]")
-ax2.set_ylabel("Velocidad [RPM]")
-ax2.set_ylim(-5.0, 1500.0)
-ax2.grid(True, linestyle="--", alpha=0.6)
-ax2.legend(loc="upper left")
-
-tiempo_inicio = time.time()
+def leer_muestra(linea):
+    """Convierte el CSV del NUEVO firmware a valores para MySQL."""
+    partes = [p.strip() for p in linea.split(",")]
+    if len(partes) != 5:
+        return None
+    try:
+        t_ms = int(partes[0])
+        conteo = int(partes[1])
+        delta = float(partes[2])
+        hz = float(partes[3])
+        estado = partes[4].upper()
+    except ValueError:
+        return None
+    if (t_ms < 0 or conteo < 0 or delta < 0 or hz < 0
+            or not math.isfinite(delta) or not math.isfinite(hz)
+            or estado not in ("HIGH", "LOW")):
+        return None
+    # Antes de dos pulsos no hay intervalo valido.
+    intervalo = round(delta, 6) if conteo >= 2 and delta > 0 else None
+    return t_ms, conteo, intervalo, round(hz, 3), estado
 
 
-def actualizar_grafica(frame):
-    """Función de refresco ejecutada periódicamente por FuncAnimation."""
-    while ser.in_waiting > 0:
-        try:
-            linea = ser.readline().decode("utf-8", errors="ignore").strip()
-            if not linea or "TIMESTAMP" in linea:
+def main():
+    puerto = detectar_puerto()
+    if not puerto:
+        print("[ERROR] Arduino no detectado. Revisa USB o configura PUERTO_MANUAL.")
+        sys.exit(1)
+
+    # Abrir serial primero: confirmar el Arduino antes de crear un ensayo.
+    try:
+        arduino = serial.Serial(puerto, BAUDIOS, timeout=0.1)
+        time.sleep(2)  # Arduino Nano puede reiniciarse al abrir el puerto.
+        print(f"[OK] Arduino en {puerto} a {BAUDIOS} baudios")
+    except serial.SerialException as exc:
+        print(f"[ERROR SERIAL] {exc}")
+        sys.exit(1)
+
+    try:
+        db = mysql.connector.connect(
+            host="localhost",
+            port=3306,
+            user="root",
+            password=getpass("Contrasena local de MySQL: "),
+            database="sensado_electromagnetico",
+        )
+    except mysql.connector.Error as exc:
+        arduino.close()
+        print(f"[ERROR MYSQL] {exc}")
+        sys.exit(1)
+
+    cursor = db.cursor()
+    fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        cursor.execute(
+            "INSERT INTO ensayos (nombre, descripcion) VALUES (%s, %s)",
+            (f"Ensayo manual {fecha}", "Movimiento manual del iman sobre la bobina"),
+        )
+        db.commit()
+    except mysql.connector.Error as exc:
+        print(f"[ERROR CREANDO ENSAYO] {exc}")
+        cursor.close()
+        db.close()
+        arduino.close()
+        sys.exit(1)
+    id_ensayo = cursor.lastrowid
+    print(f"[OK] Ensayo manual numero {id_ensayo}")
+
+    # Guardar respaldo CSV sin sobrescribir sesiones previas.
+    carpeta = Path(__file__).resolve().parent.parent / "data"
+    carpeta.mkdir(parents=True, exist_ok=True)
+    ruta = carpeta / ("manual_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv")
+    archivo = ruta.open("w", newline="", encoding="utf-8")
+    writer = csv.writer(archivo)
+    writer.writerow(["timestamp_ms", "conteo_eventos", "intervalo_s",
+                     "frecuencia_hz", "estado_logico"])
+    archivo.flush()
+
+    tiempos = deque(maxlen=ULTIMAS_MUESTRAS)
+    frecs = deque(maxlen=ULTIMAS_MUESTRAS)
+    conteos = deque(maxlen=ULTIMAS_MUESTRAS)
+    fig, (ax_hz, ax_c) = plt.subplots(2, 1, figsize=(9, 6))
+    fig.subplots_adjust(hspace=0.45)
+    linea_hz, = ax_hz.plot([], [], marker="o", markersize=3)
+    linea_c, = ax_c.plot([], [], marker="o", markersize=3)
+    ax_hz.set(title="Frecuencia de paso manual", ylabel="Frecuencia (Hz)")
+    ax_c.set(title="Conteo acumulado de eventos", xlabel="Tiempo (s)",
+             ylabel="Eventos")
+    ax_hz.grid(True)
+    ax_c.grid(True)
+    aviso_formato = False
+    total_guardadas = 0
+
+    def actualizar(_frame):
+        nonlocal aviso_formato, total_guardadas
+        while arduino.in_waiting:
+            texto = arduino.readline().decode("utf-8", errors="ignore").strip()
+            if not texto:
+                continue
+            if texto.upper().startswith("TIMESTAMP"):
+                if "RPM" in texto.upper() and not aviso_formato:
+                    print("[AVISO] Firmware anterior detectado (envia RPM). "
+                          "Carga lector_pulsos_manual_mysql.ino.")
+                    aviso_formato = True
+                continue
+            muestra = leer_muestra(texto)
+            if muestra is None:
+                if not aviso_formato:
+                    print("[AVISO] Linea incompatible. Se requiere el firmware "
+                          "nuevo con estado HIGH/LOW.")
+                    aviso_formato = True
                 continue
 
-            partes = linea.split(",")
-            if len(partes) == 5:
-                t_ms = float(partes[0])
-                ev_id = int(partes[1])
-                per_us = float(partes[2])
-                hz = float(partes[3])
-                rpm = float(partes[4])
+            t_ms, conteo, intervalo, hz, estado = muestra
+            writer.writerow([t_ms, conteo, "" if intervalo is None else intervalo,
+                             hz, estado])
+            archivo.flush()
+            try:
+                cursor.execute(
+                    "INSERT INTO mediciones "
+                    "(id_ensayo, timestamp_ms, conteo_eventos, intervalo_s, "
+                    "frecuencia_hz, estado_logico) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (id_ensayo, t_ms, conteo, intervalo, hz, estado),
+                )
+                db.commit()
+                total_guardadas += 1
+            except mysql.connector.Error as exc:
+                db.rollback()
+                print(f"[ERROR GUARDANDO] {exc}")
 
-                # Guardar en CSV
-                writer.writerow([t_ms, ev_id, per_us, hz, rpm])
-                f_csv.flush()
+            tiempos.append(t_ms / 1000.0)
+            frecs.append(hz)
+            conteos.append(conteo)
 
-                # Actualizar colas de visualización
-                t_rel = time.time() - tiempo_inicio
-                tiempos_s.append(t_rel)
-                frecuencias_hz.append(hz)
-                rpms.append(rpm)
+        if tiempos:
+            linea_hz.set_data(tiempos, frecs)
+            linea_c.set_data(tiempos, conteos)
+            xmin = max(0, tiempos[-1] - 15)
+            xmax = tiempos[-1] + 1
+            for eje in (ax_hz, ax_c):
+                eje.set_xlim(xmin, xmax)
+            ax_hz.set_ylim(-0.5, max(1, max(frecs)) * 1.25)
+            ax_c.set_ylim(-0.5, max(1, max(conteos)) * 1.25)
+        return linea_hz, linea_c
 
-        except (ValueError, IndexError):
-            continue
-
-    if tiempos_s:
-        # Actualizar datos de las líneas
-        line_hz.set_data(tiempos_s, frecuencias_hz)
-        line_rpm.set_data(tiempos_s, rpms)
-
-        # Ajuste dinámico de los límites en X
-        min_x = max(0, tiempos_s[-1] - 15)
-        max_x = tiempos_s[-1] + 1
-        ax1.set_xlim(min_x, max_x)
-        ax2.set_xlim(min_x, max_x)
-
-        # Ajuste dinámico de Y si el valor supera la escala fija
-        max_hz = max(max(frecuencias_hz, default=10), 10)
-        ax1.set_ylim(-0.5, max_hz * 1.25)
-
-        max_r = max(max(rpms, default=100), 100)
-        ax2.set_ylim(-5.0, max_r * 1.25)
-
-    return line_hz, line_rpm
+    animacion = FuncAnimation(fig, actualizar, interval=100,
+                              cache_frame_data=False)
+    try:
+        plt.show()
+    finally:
+        # Conservar una referencia a animacion evita eliminacion temprana.
+        _ = animacion
+        archivo.close()
+        arduino.close()
+        cursor.close()
+        db.close()
+        print(f"[FIN] {total_guardadas} muestras insertadas. CSV: {ruta}")
 
 
-ani = animation.FuncAnimation(fig, actualizar_grafica, interval=80, blit=False)
-
-try:
-    plt.show()
-finally:
-    ser.close()
-    f_csv.close()
-    print("[FINALIZADO] Puerto cerrado y datos guardados exitosamente.")
+if __name__ == "__main__":
+    main()
